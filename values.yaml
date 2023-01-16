@@ -10,6 +10,9 @@ postgres:
 replicaCount: 1
 oauth_enabled: False
 
+serviceAccount:
+  create: false
+
 # adminUser:
 #   username: "admin"
 #   firstname: "Superset"
@@ -25,17 +28,23 @@ oauth:
   whitelist_domain: ""
   user_registration_role: "Gamma"
 
-runAsUser: 1000
+runAsUser: 0
 
 # Install additional packages and do any other bootstrap configuration in this script
 # For production clusters it's recommended to build own image with this step done in CI
 bootstrapScript: |
   #!/bin/bash
+  rm -rf /var/lib/apt/lists/* && \
   pip install \
+    keycloak \
     psycopg2-binary==2.9.1 \
+    itsdangerous==2.0.1 \
+    elasticsearch-dbapi==0.2.9 \
+    flask-oidc==1.3.0 \
+    Flask-OpenID==1.3.0 \
+    werkzeug==1.0.1 \
     redis==3.5.3 && \
   if [ ! -f ~/bootstrap ]; then echo "Running Superset with uid {{ .Values.runAsUser }}" > ~/bootstrap; fi
-
 ## The name of the secret which we will use to generate a superset_config.py file
 ## Note: this secret must have the key superset_config.py in it and can include other files as well
 ##
@@ -51,6 +60,7 @@ envFromSecrets: []
 ## Extra environment variables that will be passed into pods
 ##
 extraEnv:
+  OIDC_OPENID_REALM: 'master'
   # Extend timeout to allow long running queries.
   # GUNICORN_TIMEOUT: 300
 
@@ -81,7 +91,92 @@ extraConfigs: {}
   #       sqlalchemy_uri: example://example-db.local
   #       tables: []
 
-extraSecrets: {}
+keycloak_url: "http://20.204.233.151:8080"
+redirect_url: "http://20.207.85.150:8088"
+sso_admin_client_secret: "bCAkdriI9Igk6I42DThiIyCG5rDRlM98"
+
+
+extraSecrets:
+#  {}
+  client_secret.json: |
+    {
+      "web": {
+        "issuer": "{{ .Values.keycloak_url }}/realms/master",
+        "auth_uri": "{{ .Values.keycloak_url }}/realms/master/protocol/openid-connect/auth",
+        "client_id": "admin-api",
+        "client_secret": "{{ .Values.sso_admin_client_secret }}",
+        "redirect_uris": [
+          "{{ .Values.redirect_url }}/*"
+        ],
+        "userinfo_uri": "{{ .Values.keycloak_url }}/realms/master/protocol/openid-connect/userinfo",
+        "token_uri": "{{ .Values.keycloak_url }}/realms/master/protocol/openid-connect/token",
+        "token_introspection_uri": "{{ .Values.keycloak_url }}/realms/master/protocol/openid-connect/token/introspect"
+      }
+    }
+  keycloak_security_manager.py: |
+    from flask_appbuilder.security.manager import AUTH_OID
+    from superset.security import SupersetSecurityManager
+    from flask_oidc import OpenIDConnect
+    from flask_appbuilder.security.views import AuthOIDView
+    from flask_login import login_user
+    from urllib.parse import quote
+    from flask_appbuilder.views import expose
+    from flask import request, redirect
+    import logging
+    
+    
+    class OIDCSecurityManager(SupersetSecurityManager):
+    
+        def __init__(self, appbuilder):
+            super(OIDCSecurityManager, self).__init__(appbuilder)
+            if self.auth_type == AUTH_OID:
+                self.oid = OpenIDConnect(self.appbuilder.get_app)
+            self.authoidview = AuthOIDCView
+    
+    class AuthOIDCView(AuthOIDView):
+    
+        @expose('/login/', methods=['GET', 'POST'])
+        def login(self, flag=True):
+            sm = self.appbuilder.sm
+            oidc = sm.oid
+            superset_roles = ["Admin", "Alpha", "Gamma", "Public", "granter", "sql_lab"]
+            print("--------------------------logging in----------------------------------")
+            @self.appbuilder.sm.oid.require_login
+            def handle_login():
+                user = sm.auth_user_oid(oidc.user_getfield('email'))
+                print("--------------------------inside handle login----------------------------------")
+                if user is None:
+                    info = oidc.user_getinfo(['preferred_username', 'given_name', 'family_name', 'email', 'roles', 'realm_access'])
+                    realm_roles = oidc.user_getfield('realm_access')["roles"];              
+                    roles = [role for role in superset_roles if role in info.get('roles', [])]
+    
+                    role_mapping = {"superset-admin": "Admin"}
+                    for role in realm_roles:
+                        if role in role_mapping:
+                            roles.append(role_mapping[role]); 
+                    logging.info(roles); 
+                    user = sm.add_user(info.get('preferred_username'), info.get('given_name', ''), info.get('family_name', ''),
+                                       info.get('email'), [sm.find_role(role) for role in roles])
+    
+                login_user(user, remember=False, force=True)
+                return redirect("/dashboard/list/")
+    
+            return handle_login()
+    
+        @expose('/logout/', methods=['GET', 'POST'])
+        def logout(self):
+            oidc = self.appbuilder.sm.oid
+    
+            oidc.logout()
+            super(AuthOIDCView, self).logout()
+            redirect_url = request.url_root.strip('/')
+            # redirect_url = request.url_root.strip('/') + self.appbuilder.get_url_for_login
+    
+            return redirect(
+                oidc.client_secrets.get('issuer') + '/protocol/openid-connect/logout?redirect_uri=' + quote(redirect_url))    
+    
+extraVolumes: []
+extraVolumeMounts: []
 
 # A dictionary of overrides to append at the end of superset_config.py - the name does not matter
 # WARNING: the order is not guaranteed
@@ -93,7 +188,6 @@ configOverrides:
       "DASHBOARD_NATIVE_FILTERS_SET": True,
       "ENABLE_TEMPLATE_PROCESSING": True
     }
-
   data_cache_config: |
     from superset.superset_typing import CacheConfig
     DATA_CACHE_CONFIG: CacheConfig = {
@@ -102,7 +196,6 @@ configOverrides:
       'CACHE_KEY_PREFIX': 'data_',
       'CACHE_REDIS_URL': 'redis://{{ template "superset.fullname" . }}-redis-headless.{{ .Release.Namespace }}.svc.cluster.local:6379/1'
     }
-
   filter_cache_config: |
     FILTER_STATE_CACHE_CONFIG: CacheConfig = {
       'CACHE_TYPE': 'RedisCache',
@@ -112,7 +205,6 @@ configOverrides:
       # should the timeout be reset when retrieving a cached value
       "REFRESH_TIMEOUT_ON_RETRIEVAL": True
     }
-
   explore_form_data_cache_config: |
     EXPLORE_FORM_DATA_CACHE_CONFIG: CacheConfig = {
         'CACHE_TYPE': 'RedisCache',
@@ -121,14 +213,15 @@ configOverrides:
         'CACHE_REDIS_URL': 'redis://{{ template "superset.fullname" . }}-redis-headless.{{ .Release.Namespace }}.svc.cluster.local:6379/1',
         "REFRESH_TIMEOUT_ON_RETRIEVAL": True
     }
-
   sql_alchemy_config: |
     SQLALCHEMY_DATABASE_URI = 'postgresql://{{ tpl .Values.postgres.superset.db_username . }}:{{ tpl .Values.postgres.superset.db_password . }}@{{ template "superset.fullname" . }}-postgresql-hl.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ tpl .Values.postgres.superset.db_name . }}'
     SQLALCHEMY_TRACK_MODIFICATIONS = True
     SECRET_KEY = 'thisISaSECRET_1234'
 
+configOverridesFiles: {}
 
-configMountPath: "/etc/superset"
+# configMountPath: "/etc/superset"
+configMountPath: "/app/pythonpath"
 
 extraConfigMountPath: "/app/configs"
 
@@ -136,14 +229,14 @@ image:
   # repository: amancevice/superset
   # tag: edge
   repository: apache/superset
-  tag: latest
+  tag: 2.0.0
   pullPolicy: Always
 
 imagePullSecrets: []
 
 
 service:
-  type: NodePort
+  type: LoadBalancer
   port: 8088
   annotations: {}
 
@@ -180,10 +273,14 @@ resources: {}
 ##
 ## Superset node configuration
 supersetNode:
+  command:
+    - "/bin/sh"
+    - "-c"
+    - ". {{ .Values.configMountPath }}/superset_bootstrap.sh; /usr/bin/run-server.sh"
   connections:
     redis_host: '{{ template "superset.fullname" . }}-redis-headless'
     redis_port: "6379"
-    db_host: '{{ template "superset.fullname" . }}-postgres-headless'
+    db_host: '{{ template "superset.fullname" . }}-postgresql-hl.{{ .Release.Namespace }}.svc.cluster.local'
     db_port: "{{ .Values.postgres.db_port }}"
     db_user: "{{ .Values.postgres.superset.db_username }}"
     db_pass: "{{ .Values.postgres.superset.db_password }}"
@@ -220,7 +317,7 @@ init:
     - "-c"
     - ". {{ .Values.configMountPath }}/superset_bootstrap.sh; . {{ .Values.configMountPath }}/superset_init.sh"
   enabled: true
-  createAdmin: true
+  createAdmin: false
   adminUser:
     username: "admin"
     firstname: "Superset"
@@ -262,7 +359,7 @@ redis:
   ##
   ## Use the redis chart dependency.
   ## Set to false if bringing your own redis.
-  enabled: true
+  enabled: false
   usePassword: false
   ##
   ## If you are bringing your own redis, you can set the host in redisHost.
